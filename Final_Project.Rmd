@@ -1,0 +1,313 @@
+---
+title: "Final_Project"
+output: html_document
+date: "2025-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cluster)
+library(readr)
+library(scales)
+library(caret)
+library(ranger)
+library(tidymodels)
+library(parsnip)
+```
+
+```{r Cluster}
+df <- read_csv("austin_listings.csv")
+
+df_clean <- df %>%
+  select(room_type, accommodates, bathrooms, bedrooms, beds, price,
+         number_of_reviews, host_is_superhost) %>%
+  mutate(
+    price = as.numeric(gsub("[$,]", "", as.character(price))),
+    host_is_superhost = as.numeric(host_is_superhost),
+    room_type = as.numeric(as.factor(room_type))
+  ) %>%
+  drop_na()
+
+df_scaled <- df_clean %>%
+  mutate(across(everything(), scale))
+
+k_values <- 1:10
+wss <- numeric(length(k_values))
+
+for (k in k_values) {
+  kmeans_result <- kmeans(df_scaled, centers = k, nstart = 25)
+  wss[k] <- kmeans_result$tot.withinss  
+}
+
+ggplot(data.frame(K = k_values, WSS = wss), aes(x = K, y = WSS)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Elbow Method for Optimal K",
+       x = "Number of Clusters (K)",
+       y = "Within-Cluster Sum of Squares (WSS)") +
+  theme_minimal()
+
+set.seed(42)
+k <- 3  
+kmeans_result <- kmeans(df_scaled, centers = k, nstart = 25)
+
+silhouette_scores <- silhouette(kmeans_result$cluster, dist(df_scaled))
+
+
+plot(silhouette_scores, main = paste("Silhouette Plot for K =", k),
+     col = 1:k, border = NA, # color by clusters
+     xlab = "Silhouette Width", ylab = "Cluster", cex.axis = 0.7, cex.lab = 0.7)
+
+pca_result <- prcomp(df_scaled, center = TRUE, scale. = TRUE)
+pca_data <- as_tibble(pca_result$x[, 1:2])
+names(pca_data) <- c("pca1", "pca2")
+
+df_final <- bind_cols(df_clean, pca_data) %>%
+  mutate(cluster = as.factor(kmeans_result$cluster))
+
+cluster_summary <- df_final %>%
+  group_by(cluster) %>%
+  summarise(
+    count = n(),
+    avg_price = round(mean(price), 2),
+    avg_accommodates = round(mean(accommodates), 2),
+    avg_bathrooms = round(mean(bathrooms), 2),
+    avg_bedrooms = round(mean(bedrooms), 2),
+    avg_beds = round(mean(beds), 2),
+    avg_reviews = round(mean(number_of_reviews), 1),   
+    avg_room_type_code = round(mean(room_type), 1),
+    superhost_rate = round(mean(host_is_superhost) * 100, 1)
+  )
+
+print(cluster_summary)
+
+ggplot(df_final, aes(x = pca1, y = pca2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(title = paste("K-Means Clustering (k =", k, ") on Austin Listings"),
+       x = "PCA Component 1", y = "PCA Component 2") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2")
+
+```
+
+```{r Vanilla}
+austin_listings <- read.csv("austin_listings.csv")
+holdout_data <- read.csv("holdout_x_correct.csv")
+
+austin_listings_clean <- austin_listings %>%
+  drop_na(price, host_is_superhost, bedrooms, bathrooms, number_of_reviews)
+
+features <- c('host_is_superhost', 'bedrooms', 'bathrooms', 'number_of_reviews')
+target <- 'price'
+
+X <- austin_listings_clean %>%
+  select(all_of(features))
+
+y <- austin_listings_clean[[target]]
+
+set.seed(42)
+trainIndex <- createDataPartition(y, p = .8, list = FALSE, times = 1)
+X_train <- X[trainIndex,]
+X_val <- X[-trainIndex,]
+y_train <- y[trainIndex]
+y_val <- y[-trainIndex]
+
+lm_model <- lm(price ~ ., data = cbind(X_train, price = y_train))
+
+y_pred <- predict(lm_model, X_val)
+
+rmse <- sqrt(mean((y_pred - y_val)^2, na.rm = TRUE))
+
+r2 <- 1 - sum((y_pred - y_val)^2) / sum((y_val - mean(y_val))^2)
+
+mae <- mean(abs(y_pred - y_val))
+
+threshold <- 0.10  # 10% threshold
+accuracy <- mean(abs(y_pred - y_val) / y_val <= threshold) * 100
+
+metrics_table <- tibble(
+  Metric = c("RMSE", "R²", "MAE", "Accuracy"),
+  Value = c(rmse, r2, mae, accuracy)
+)
+
+print(metrics_table)
+
+holdout_data_clean <- holdout_data %>%
+  select(all_of(features))
+
+holdout_predictions <- predict(lm_model, holdout_data_clean)
+
+holdout_data$predicted_price <- holdout_predictions
+
+head(holdout_data[, c("id", "predicted_price")])
+
+```
+
+```{r Radial}
+
+austin_listings_clean <- austin_listings %>%
+  drop_na(price, host_is_superhost, bedrooms, bathrooms, number_of_reviews)
+
+features <- c('host_is_superhost', 'bedrooms', 'bathrooms', 'number_of_reviews')
+target <- 'price'
+
+X <- austin_listings_clean %>%
+  select(all_of(features))
+
+y <- austin_listings_clean[[target]]
+
+set.seed(42)
+trainIndex <- createDataPartition(y, p = .8, list = FALSE, times = 1)
+X_train <- X[trainIndex,]
+X_val <- X[-trainIndex,]
+y_train <- y[trainIndex]
+y_val <- y[-trainIndex]
+
+svm_model <- svm_rbf(mode = "regression", cost = 1, rbf_sigma = 0.1) %>%
+  set_engine("kernlab") %>%
+  fit(price ~ ., data = cbind(X_train, price = y_train))
+
+y_pred_svm <- predict(svm_model, X_val)$.pred
+
+if (any(is.na(y_pred_svm))) {
+  print("Warning: There are NA values in the predictions.")
+}
+
+rmse_svm <- sqrt(mean((y_pred_svm - y_val)^2, na.rm = TRUE))
+
+r2_svm <- 1 - sum((y_pred_svm - y_val)^2) / sum((y_val - mean(y_val))^2)
+
+mae_svm <- mean(abs(y_pred_svm - y_val))
+
+accuracy_svm <- mean(abs(y_pred_svm - y_val) / y_val <= 0.10) * 100
+
+metrics_table_svm <- tibble(
+  Metric = c("RMSE", "R²", "MAE", "Accuracy"),
+  Value = c(rmse_svm, r2_svm, mae_svm, accuracy_svm)
+)
+
+print(metrics_table_svm)
+
+holdout_data_clean <- holdout_data %>%
+  select(all_of(features))
+
+holdout_predictions_svm <- predict(svm_model, holdout_data_clean)$.pred
+
+holdout_data$predicted_price_svm <- holdout_predictions_svm
+
+head(holdout_data[, c("id", "predicted_price_svm")])
+```
+
+```{r Random Forest}
+train_raw <- read_csv("austin_listings.csv")
+
+train_clean <- train_raw %>%
+  mutate(
+    price = as.numeric(gsub("[$,]", "", price)),
+    price = pmin(price, 1000),  
+    log_price = log(price),
+    host_is_superhost = as.factor(host_is_superhost),
+    room_type = as.factor(room_type),
+    bedrooms = ifelse(is.na(bedrooms), 1, bedrooms),
+    bathrooms = ifelse(is.na(bathrooms), 1, bathrooms),
+    number_of_reviews = ifelse(is.na(number_of_reviews), 0, number_of_reviews),
+    accommodates_bedroom_ratio = accommodates / bedrooms,
+    accommodates_bathroom_ratio = accommodates / bathrooms,
+    price_per_bedroom = price / bedrooms,
+    room_type_host_interaction = as.numeric(room_type) * as.numeric(host_is_superhost)  
+  ) %>%
+  select(
+    log_price, accommodates, bedrooms, bathrooms, minimum_nights,
+    number_of_reviews, host_is_superhost, room_type, accommodates_bedroom_ratio, 
+    accommodates_bathroom_ratio, price_per_bedroom, room_type_host_interaction
+  ) %>%
+  drop_na()
+
+set.seed(42)
+split <- createDataPartition(train_clean$log_price, p = 0.8, list = FALSE)
+train_set <- train_clean[split, ]
+test_set  <- train_clean[-split, ]
+
+ctrl <- trainControl(
+  method = "cv", number = 10,     
+  savePredictions = "final",
+  allowParallel   = TRUE
+)
+
+grid <- expand.grid(
+  mtry           = c(2, 3, 4, 5, 6), 
+  splitrule      = "variance",        
+  min.node.size  = c(1, 2, 5, 10)     
+)
+
+set.seed(42)
+
+rf_best <- train(
+  log_price ~ ., data = train_set,
+  method = "ranger",  
+  trControl = ctrl,
+  tuneGrid = grid,
+  importance = "impurity",  
+  num.trees  = 1000      
+)
+
+
+
+log_preds <- predict(rf_best, newdata = test_set)
+preds     <- exp(log_preds)  
+actuals   <- exp(test_set$log_price)  
+
+
+rmse <- sqrt(mean((preds - actuals)^2))  
+mae  <- mean(abs(preds - actuals))  
+rsq  <- cor(preds, actuals)^2  
+
+accuracy <- mean(abs(preds - actuals) / actuals <= 0.10) * 100
+
+
+metrics_table <- tibble(
+  Metric = c("RMSE", "MAE", "R²", "Accuracy"),
+  Value = c(round(rmse, 2), round(mae, 2), round(rsq, 4), round(accuracy, 2))
+)
+
+# Print the metrics table
+print(metrics_table)
+
+
+holdout_raw <- read_csv("holdout_x_correct.csv")
+
+holdout_clean <- holdout_raw %>%
+  mutate(
+    host_is_superhost = as.factor(host_is_superhost),
+    room_type = as.factor(room_type),
+    bedrooms = ifelse(is.na(bedrooms), 1, bedrooms),
+    bathrooms = ifelse(is.na(bathrooms), 1, bathrooms),
+    number_of_reviews = ifelse(is.na(number_of_reviews), 0, number_of_reviews),
+    accommodates_bedroom_ratio = accommodates / bedrooms,
+    accommodates_bathroom_ratio = accommodates / bathrooms,
+    price_per_bedroom = accommodates / bedrooms,
+    room_type_host_interaction = as.numeric(room_type) * as.numeric(host_is_superhost)
+  ) %>%
+  select(
+    id, accommodates, bedrooms, bathrooms, minimum_nights,
+    number_of_reviews, host_is_superhost, room_type, accommodates_bedroom_ratio, 
+    accommodates_bathroom_ratio, price_per_bedroom, room_type_host_interaction
+  ) %>%
+  drop_na()
+
+
+holdout_clean$room_type        <- factor(holdout_clean$room_type, levels = levels(train_set$room_type))
+holdout_clean$host_is_superhost <- factor(holdout_clean$host_is_superhost, levels = levels(train_set$host_is_superhost))
+
+
+holdout_clean$predicted_price <- exp(predict(rf_best, newdata = holdout_clean))  # Inverse log transformation
+
+
+write_csv(holdout_clean %>% select(id, predicted_price), "predicted_prices_holdout.csv")
+
+
+head(holdout_clean)
+
+```
+
